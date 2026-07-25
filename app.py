@@ -78,8 +78,13 @@ def download_subtitles(youtube_url: str, session_dir: str):
         "--skip-download",
         "--write-subs",
         "--write-auto-sub",
-        "--sub-lang", "id,en",
+        "--sub-lang", "id",
         "--convert-subs", "srt",
+        "--extractor-args", "youtube:player_client=android",
+        "--js-runtimes", "node",
+        "--sleep-requests", "3",
+        "--retries", "3",
+        "--retry-sleep", "10",
         "-o", out_template + ".%(ext)s",
         youtube_url,
     ]
@@ -91,6 +96,29 @@ def download_subtitles(youtube_url: str, session_dir: str):
         return None, "Timeout saat mengunduh subtitle (300 detik)."
 
     matches = glob.glob(out_template + "*.srt")
+
+    # Kalau subtitle Indonesia tidak ada, coba lagi khusus bahasa Inggris
+    if not matches:
+        cmd_en = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-sub",
+            "--sub-lang", "en",
+            "--convert-subs", "srt",
+            "--extractor-args", "youtube:player_client=android",
+            "--js-runtimes", "node",
+            "--sleep-requests", "3",
+            "--retries", "3",
+            "--retry-sleep", "10",
+            "-o", out_template + ".%(ext)s",
+            youtube_url,
+        ]
+        try:
+            result = subprocess.run(cmd_en, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return None, "Timeout saat mengunduh subtitle (300 detik)."
+        matches = glob.glob(out_template + "*.srt")
     if not matches:
         return None, (result.stderr or "Subtitle tidak ditemukan untuk video ini.")[-1500:]
 
@@ -278,16 +306,20 @@ def run_job(session_id, video_path, youtube_url):
     subtitle_entries = None
     if youtube_url:
         state["subtitle_status"] = "downloading"
+        print(f"[subtitle] Mengunduh subtitle untuk: {youtube_url}")
         srt_path, err = download_subtitles(youtube_url, session_dir)
         if srt_path:
             subtitle_entries = parse_srt(srt_path)
             if subtitle_entries:
                 state["subtitle_status"] = "ok"
+                print(f"[subtitle] Berhasil, {len(subtitle_entries)} baris subtitle ditemukan.")
             else:
                 state["subtitle_status"] = "empty"
+                print("[subtitle] File subtitle ditemukan tapi kosong/tidak terparsing.")
         else:
             state["subtitle_status"] = "failed"
             state["subtitle_error"] = err
+            print(f"[subtitle] GAGAL mengunduh subtitle. Detail:\n{err}")
     else:
         state["subtitle_status"] = "skipped"
 
