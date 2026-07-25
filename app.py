@@ -225,10 +225,11 @@ CROP_1TO1 = (
     "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
 )
 
+# REVISI UKURAN DAN POSISI SUBTITLE
 SUBTITLE_STYLE = (
-    "FontName=Arial,FontSize=26,Bold=1,"
+    "FontName=Arial,FontSize=20,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-    "BorderStyle=1,Outline=3,Shadow=1,MarginV=70,Alignment=2"
+    "BorderStyle=1,Outline=2,Shadow=1,MarginV=30,Alignment=2"
 )
 
 
