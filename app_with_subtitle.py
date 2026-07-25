@@ -191,32 +191,33 @@ def _run_ffmpeg_with_progress(cmd, duration, on_progress):
     return success, "".join(stderr_lines)[-2000:]
 
 
-def cut_clip_copy(input_path, start, end, out_path, on_progress):
-    """Potong cepat tanpa re-encode (stream-copy). Tidak bisa dipakai bareng subtitle burn-in."""
-    duration = max(1, to_seconds(end) - to_seconds(start))
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", start,
-        "-i", input_path,
-        "-t", str(duration),
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        "-nostats",
-        out_path,
-    ]
-    return _run_ffmpeg_with_progress(cmd, duration, on_progress)
+CROP_1TO1 = (
+    "crop="
+    "w='min(iw\\,ih)':h='min(iw\\,ih)':"
+    "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
+)
+
+SUBTITLE_STYLE = (
+    "FontName=Arial,FontSize=26,Bold=1,"
+    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+    "BorderStyle=1,Outline=3,Shadow=1,MarginV=70,Alignment=2"
+)
 
 
-def cut_clip_with_subtitle(input_path, start, end, srt_path, out_path, on_progress):
-    """Potong + burn-in subtitle. Wajib re-encode karena ada filter video."""
+def cut_clip(input_path, start, end, out_path, on_progress, srt_path=None):
+    """
+    Potong video, crop ke rasio 1:1 (persegi, tengah), dan opsional
+    burn-in subtitle. Selalu re-encode karena ada filter crop.
+    """
     duration = max(1, to_seconds(end) - to_seconds(start))
-    escaped = escape_for_ffmpeg_filter(srt_path)
-    style = "FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=45"
-    vf = f"subtitles='{escaped}':force_style='{style}'"
+
+    filters = [CROP_1TO1]
+    has_subtitle = bool(srt_path)
+    if has_subtitle:
+        escaped = escape_for_ffmpeg_filter(srt_path)
+        filters.append(f"subtitles='{escaped}':force_style='{SUBTITLE_STYLE}'")
+    vf = ",".join(filters)
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", start,
@@ -301,22 +302,17 @@ def run_job(session_id, video_path, youtube_url):
         end_sec = to_seconds(clip["end"])
 
         used_subtitle = False
+        clip_srt_path = None
         if subtitle_entries:
-            clip_srt_path = os.path.join(session_dir, f"{clip['filename']}.srt")
-            n_lines = build_clip_srt(subtitle_entries, start_sec, end_sec, clip_srt_path)
+            candidate_srt = os.path.join(session_dir, f"{clip['filename']}.srt")
+            n_lines = build_clip_srt(subtitle_entries, start_sec, end_sec, candidate_srt)
             if n_lines > 0:
-                success, log = cut_clip_with_subtitle(
-                    video_path, clip["start"], clip["end"], clip_srt_path, out_path, cb
-                )
+                clip_srt_path = candidate_srt
                 used_subtitle = True
-            else:
-                success, log = cut_clip_copy(
-                    video_path, clip["start"], clip["end"], out_path, cb
-                )
-        else:
-            success, log = cut_clip_copy(
-                video_path, clip["start"], clip["end"], out_path, cb
-            )
+
+        success, log = cut_clip(
+            video_path, clip["start"], clip["end"], out_path, cb, srt_path=clip_srt_path
+        )
 
         clip["has_subtitle"] = used_subtitle
         if success:
@@ -365,7 +361,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
   <h1>🎬 Clip Cutter</h1>
-  <p class="sub">Potong video jadi beberapa klip presisi (audio & video tetap sinkron)</p>
+  <p class="sub">Potong video jadi beberapa klip presisi, format 1:1 (persegi), audio & video tetap sinkron</p>
   <p class="out-info">📁 Hasil disimpan ke: <code>{output_dir}</code></p>
 
   <form method="POST" action="/process">
