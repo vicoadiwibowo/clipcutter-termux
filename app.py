@@ -4,18 +4,22 @@ Clip Cutter Web - untuk dijalankan di Termux
 Potong video berdasarkan daftar timestamp yang di-paste,
 dengan audio & video presisi (sinkron, tidak telat),
 progress % real-time per klip, preview video di web,
-dan opsi burn-in subtitle otomatis dari link YouTube.
+dan opsi burn-in subtitle otomatis menggunakan youtube-transcript-api (Anti-429).
 """
 
 import os
 import re
 import time
 import uuid
-import glob
 import threading
 import shutil
 import subprocess
 from flask import Flask, request, send_from_directory, url_for, redirect, jsonify
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+except ImportError:
+    YouTubeTranscriptApi = None
 
 app = Flask(__name__)
 
@@ -24,9 +28,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LINE_PATTERN = re.compile(
     r"^\s*(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+(.+?)\s*$"
-)
-SRT_TIME_PATTERN = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
 
 JOBS = {}
@@ -64,92 +65,41 @@ def to_seconds(hms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s)
 
 
-# ---------- Subtitle: download & parsing ----------
+# ---------- Subtitle: download API Murni (Anti-429) ----------
 
-def download_subtitles(youtube_url: str, session_dir: str):
+def get_subtitle_entries(youtube_url: str):
     """
-    Download subtitle (manual kalau ada, auto-caption kalau tidak) dari
-    video YouTube memakai yt-dlp, tanpa mengunduh videonya.
-    Return: (path_srt atau None, pesan_error atau None)
+    Mengambil subtitle murni via API text tanpa mendownload video.
+    Return: (list_of_entries, error_message)
     """
-    out_template = os.path.join(session_dir, "full_sub")
+    if not YouTubeTranscriptApi:
+        return None, "Library youtube-transcript-api belum terinstall. Buka Termux lalu ketik: pip install youtube-transcript-api"
+
+    video_id_match = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]+)", youtube_url)
+    if not video_id_match:
+        return None, "URL YouTube tidak valid atau ID video tidak ditemukan."
     
-    # REVISI: Menghapus extractor-args android yang bermasalah dan menambah jeda anti-429
-    cmd = [
-        "yt-dlp",
-        "--skip-download",
-        "--write-subs",
-        "--write-auto-sub",
-        "--sub-lang", "id",
-        "--convert-subs", "srt",
-        "--sleep-requests", "4",
-        "--retries", "5",
-        "--retry-sleep", "15",
-        "-o", out_template + ".%(ext)s",
-        youtube_url,
-    ]
+    video_id = video_id_match.group(1)
+    
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except FileNotFoundError:
-        return None, "yt-dlp belum terinstall. Jalankan: pip install yt-dlp"
-    except subprocess.TimeoutExpired:
-        return None, "Timeout saat mengunduh subtitle (300 detik)."
-
-    matches = glob.glob(out_template + "*.srt")
-
-    # Kalau subtitle Indonesia tidak ada, coba lagi khusus bahasa Inggris
-    if not matches:
-        cmd_en = [
-            "yt-dlp",
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-sub",
-            "--sub-lang", "en",
-            "--convert-subs", "srt",
-            "--sleep-requests", "4",
-            "--retries", "5",
-            "--retry-sleep", "15",
-            "-o", out_template + ".%(ext)s",
-            youtube_url,
-        ]
-        try:
-            result = subprocess.run(cmd_en, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return None, "Timeout saat mengunduh subtitle (300 detik)."
-        matches = glob.glob(out_template + "*.srt")
+        # Coba ambil subtitle bahasa Indonesia, fallback ke Inggris
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en'])
         
-    if not matches:
-        return None, (result.stderr or "Subtitle tidak ditemukan atau kena limit 429 YouTube.")[-1500:]
-
-    # Prioritaskan subtitle bahasa Indonesia kalau ada beberapa file
-    matches.sort(key=lambda p: 0 if ".id." in p else 1)
-    return matches[0], None
-
-
-def parse_srt(path: str):
-    text = open(path, encoding="utf-8", errors="ignore").read()
-    entries = []
-    blocks = re.split(r"\n\s*\n", text.strip())
-    for block in blocks:
-        lines = block.strip().splitlines()
-        if len(lines) < 2:
-            continue
-        match = None
-        idx = 0
-        for i, line in enumerate(lines):
-            match = SRT_TIME_PATTERN.search(line)
-            if match:
-                idx = i
-                break
-        if not match:
-            continue
-        h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, match.groups())
-        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
-        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
-        text_lines = [l for l in lines[idx + 1:] if l.strip()]
-        if text_lines:
-            entries.append((start, end, "\n".join(text_lines)))
-    return entries
+        entries = []
+        for t in transcript:
+            start = t['start']
+            end = start + t['duration']
+            text = t['text'].replace('\n', ' ')
+            entries.append((start, end, text))
+            
+        return entries, None
+        
+    except TranscriptsDisabled:
+        return None, "Subtitle dinonaktifkan untuk video ini."
+    except NoTranscriptFound:
+        return None, "Subtitle bahasa Indonesia atau Inggris tidak ditemukan pada video ini."
+    except Exception as e:
+        return None, f"Gagal mengambil API subtitle: {str(e)}"
 
 
 def build_clip_srt(entries, clip_start_sec, clip_end_sec, out_path):
@@ -224,7 +174,6 @@ CROP_1TO1 = (
     "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
 )
 
-# Setingan Subtitle Sebelumnya
 SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=20,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
@@ -306,20 +255,17 @@ def run_job(session_id, video_path, youtube_url):
     subtitle_entries = None
     if youtube_url:
         state["subtitle_status"] = "downloading"
-        print(f"[subtitle] Mengunduh subtitle untuk: {youtube_url}")
-        srt_path, err = download_subtitles(youtube_url, session_dir)
-        if srt_path:
-            subtitle_entries = parse_srt(srt_path)
-            if subtitle_entries:
-                state["subtitle_status"] = "ok"
-                print(f"[subtitle] Berhasil, {len(subtitle_entries)} baris subtitle ditemukan.")
-            else:
-                state["subtitle_status"] = "empty"
-                print("[subtitle] File subtitle ditemukan tapi kosong/tidak terparsing.")
+        print(f"[subtitle] Mengambil teks subtitle untuk: {youtube_url}")
+        
+        entries, err = get_subtitle_entries(youtube_url)
+        if entries:
+            subtitle_entries = entries
+            state["subtitle_status"] = "ok"
+            print(f"[subtitle] Berhasil, {len(subtitle_entries)} baris teks ditemukan.")
         else:
             state["subtitle_status"] = "failed"
             state["subtitle_error"] = err
-            print(f"[subtitle] GAGAL mengunduh subtitle. Detail:\n{err}")
+            print(f"[subtitle] GAGAL mengambil subtitle. Detail: {err}")
     else:
         state["subtitle_status"] = "skipped"
 
@@ -468,10 +414,10 @@ STATUS_TEMPLATE = """<!DOCTYPE html>
 
     const subtitleLabels = {{
       skipped: "",
-      downloading: "⏳ Mengunduh subtitle dari YouTube...",
-      ok: "✅ Subtitle berhasil diunduh & akan di-burn ke klip",
+      downloading: "⏳ Mengambil API subtitle dari YouTube...",
+      ok: "✅ Subtitle berhasil diambil & akan di-burn ke klip",
       empty: "⚠️ Subtitle ditemukan tapi kosong di rentang waktu klip — klip diproses tanpa subtitle",
-      failed: "⚠️ Gagal mengunduh subtitle — klip diproses tanpa subtitle"
+      failed: "⚠️ Gagal mengambil subtitle — klip diproses tanpa subtitle"
     }};
 
     async function poll() {{
