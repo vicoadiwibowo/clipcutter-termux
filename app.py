@@ -235,15 +235,38 @@ CROP_1TO1 = (
     "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
 )
 
+WATERMARK_TEXT = "@omah_cliperr"
+WATERMARK_OPACITY = 0.15  # 0.0 = tak terlihat, 1.0 = solid penuh
 
-def cut_clip(input_path, start, end, out_path, on_progress, ass_path=None):
+
+def escape_drawtext(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+    )
+
+
+def build_watermark_filter(square_size: int) -> str:
+    fontsize = max(18, round(square_size * 0.045))
+    escaped = escape_drawtext(WATERMARK_TEXT)
+    return (
+        f"drawtext=text='{escaped}':"
+        f"fontcolor=white@{WATERMARK_OPACITY}:"
+        f"fontsize={fontsize}:"
+        "x=(w-text_w)/2:y=(h-text_h)/2"
+    )
+
+
+def cut_clip(input_path, start, end, out_path, on_progress, ass_path=None, square_size=1080):
     """
-    Potong video, crop ke rasio 1:1 (persegi, tengah), dan opsional
-    burn-in subtitle dari file .ass yang sudah presisi ukurannya.
+    Potong video, crop ke rasio 1:1 (persegi, tengah), tambahkan watermark
+    samar di tengah, dan opsional burn-in subtitle dari file .ass presisi.
     """
     duration = max(1, to_seconds(end) - to_seconds(start))
 
-    filters = [CROP_1TO1]
+    filters = [CROP_1TO1, build_watermark_filter(square_size)]
     has_subtitle = bool(ass_path)
     if has_subtitle:
         escaped = escape_for_ffmpeg_filter(ass_path)
@@ -338,7 +361,8 @@ def run_job(session_id, video_path, full_srt_path):
                 used_subtitle = True
 
         success, log = cut_clip(
-            video_path, clip["start"], clip["end"], out_path, cb, ass_path=clip_ass_path
+            video_path, clip["start"], clip["end"], out_path, cb,
+            ass_path=clip_ass_path, square_size=square_size
         )
 
         clip["has_subtitle"] = used_subtitle
