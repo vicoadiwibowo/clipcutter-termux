@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Clip Cutter Web - untuk dijalankan di Termux
+Clip Cutter Web - untuk dijalankan di Termux / OpenWrt
 Potong video berdasarkan daftar timestamp yang di-paste,
 dengan audio & video presisi (sinkron, tidak telat),
 progress % real-time per klip, preview video di web,
-dan opsi burn-in subtitle otomatis menggunakan youtube-transcript-api (Anti-429).
+dan fitur upload manual subtitle (.srt) agar kebal dari blokir YouTube (Anti-429).
 """
 
 import os
@@ -16,11 +16,6 @@ import shutil
 import subprocess
 from flask import Flask, request, send_from_directory, url_for, redirect, jsonify
 
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-except ImportError:
-    YouTubeTranscriptApi = None
-
 app = Flask(__name__)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -28,6 +23,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LINE_PATTERN = re.compile(
     r"^\s*(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+(.+?)\s*$"
+)
+SRT_TIME_PATTERN = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
 
 JOBS = {}
@@ -65,41 +63,37 @@ def to_seconds(hms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s)
 
 
-# ---------- Subtitle: download API Murni (Anti-429) ----------
+# ---------- Subtitle: Parsing Lokal (.srt) ----------
 
-def get_subtitle_entries(youtube_url: str):
-    """
-    Mengambil subtitle murni via API text tanpa mendownload video.
-    Return: (list_of_entries, error_message)
-    """
-    if not YouTubeTranscriptApi:
-        return None, "Library youtube-transcript-api belum terinstall. Buka Termux lalu ketik: pip install youtube-transcript-api"
-
-    video_id_match = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]+)", youtube_url)
-    if not video_id_match:
-        return None, "URL YouTube tidak valid atau ID video tidak ditemukan."
-    
-    video_id = video_id_match.group(1)
-    
+def parse_srt(path: str):
     try:
-        # Coba ambil subtitle bahasa Indonesia, fallback ke Inggris
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en'])
-        
-        entries = []
-        for t in transcript:
-            start = t['start']
-            end = start + t['duration']
-            text = t['text'].replace('\n', ' ')
-            entries.append((start, end, text))
-            
-        return entries, None
-        
-    except TranscriptsDisabled:
-        return None, "Subtitle dinonaktifkan untuk video ini."
-    except NoTranscriptFound:
-        return None, "Subtitle bahasa Indonesia atau Inggris tidak ditemukan pada video ini."
+        text = open(path, encoding="utf-8", errors="ignore").read()
     except Exception as e:
-        return None, f"Gagal mengambil API subtitle: {str(e)}"
+        print(f"Error membaca file srt: {e}")
+        return []
+        
+    entries = []
+    blocks = re.split(r"\n\s*\n", text.strip())
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if len(lines) < 2:
+            continue
+        match = None
+        idx = 0
+        for i, line in enumerate(lines):
+            match = SRT_TIME_PATTERN.search(line)
+            if match:
+                idx = i
+                break
+        if not match:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, match.groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+        text_lines = [l for l in lines[idx + 1:] if l.strip()]
+        if text_lines:
+            entries.append((start, end, "\n".join(text_lines)))
+    return entries
 
 
 def build_clip_srt(entries, clip_start_sec, clip_end_sec, out_path):
@@ -241,31 +235,20 @@ def cleanup_old_outputs():
 
 # ---------- Job utama ----------
 
-def run_job(session_id, video_path, youtube_url):
+def run_job(session_id, video_path, full_srt_path):
     state = JOBS[session_id]
     session_dir = os.path.join(OUTPUT_DIR, session_id)
 
-    try:
-        os.makedirs(session_dir, exist_ok=True)
-    except OSError as e:
-        state["fatal_error"] = f"Tidak bisa membuat folder output: {e}"
-        state["finished"] = True
-        return
-
     subtitle_entries = None
-    if youtube_url:
-        state["subtitle_status"] = "downloading"
-        print(f"[subtitle] Mengambil teks subtitle untuk: {youtube_url}")
-        
-        entries, err = get_subtitle_entries(youtube_url)
-        if entries:
-            subtitle_entries = entries
+    if full_srt_path and os.path.exists(full_srt_path):
+        print(f"[subtitle] Membaca file subtitle lokal: {full_srt_path}")
+        subtitle_entries = parse_srt(full_srt_path)
+        if subtitle_entries:
             state["subtitle_status"] = "ok"
             print(f"[subtitle] Berhasil, {len(subtitle_entries)} baris teks ditemukan.")
         else:
-            state["subtitle_status"] = "failed"
-            state["subtitle_error"] = err
-            print(f"[subtitle] GAGAL mengambil subtitle. Detail: {err}")
+            state["subtitle_status"] = "empty"
+            print("[subtitle] File subtitle kosong atau format tidak sesuai.")
     else:
         state["subtitle_status"] = "skipped"
 
@@ -311,7 +294,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Clip Cutter - Termux</title>
+<title>Clip Cutter</title>
 <style>
   :root {{
     --bg:#0f1115; --panel:#171a21; --accent:#4f8cff;
@@ -329,6 +312,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
     border:1px solid #2c3140; border-radius:8px; padding:10px;
     font-size:0.9rem; font-family:monospace; }}
   textarea {{ min-height:220px; resize:vertical; }}
+  input[type=file] {{ width:100%; color:var(--text); font-size:0.9rem; padding:6px 0; }}
   button {{ background:var(--accent); color:white; border:none;
     padding:12px 20px; border-radius:8px; font-size:1rem;
     font-weight:600; cursor:pointer; width:100%; margin-top:12px; }}
@@ -342,15 +326,16 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
   <p class="sub">Potong video jadi beberapa klip presisi, format 1:1 (persegi), audio & video tetap sinkron</p>
   <p class="out-info">📁 Hasil disimpan ke: <code>{output_dir}</code></p>
 
-  <form method="POST" action="/process">
+  <form method="POST" action="/process" enctype="multipart/form-data">
     <div class="panel">
       <label>Lokasi File Video</label>
-      <input type="text" name="video_path" placeholder="/storage/emulated/0/snaptube/download/SnapTube Video/nama_video.mp4" required>
+      <input type="text" name="video_path" placeholder="/storage/emulated/0/snaptube/download/nama_video.mp4" required>
     </div>
 
     <div class="panel">
-      <label>Link YouTube <span class="opt-tag">(opsional — untuk ambil subtitle otomatis & di-burn ke klip)</span></label>
-      <input type="text" name="youtube_url" placeholder="https://www.youtube.com/watch?v=xxxxxxxx">
+      <label>Upload Subtitle .srt <span class="opt-tag">(opsional — untuk di-burn ke klip)</span></label>
+      <input type="file" name="srt_file" accept=".srt">
+      <div class="example">Download subtitle manual (misal via downsub.com) lalu upload ke sini agar 100% bebas error.</div>
     </div>
 
     <div class="panel">
@@ -414,10 +399,8 @@ STATUS_TEMPLATE = """<!DOCTYPE html>
 
     const subtitleLabels = {{
       skipped: "",
-      downloading: "⏳ Mengambil API subtitle dari YouTube...",
-      ok: "✅ Subtitle berhasil diambil & akan di-burn ke klip",
-      empty: "⚠️ Subtitle ditemukan tapi kosong di rentang waktu klip — klip diproses tanpa subtitle",
-      failed: "⚠️ Gagal mengambil subtitle — klip diproses tanpa subtitle"
+      ok: "✅ File subtitle .srt berhasil diproses & akan di-burn ke klip",
+      empty: "⚠️ File subtitle kosong atau tidak sesuai format — klip diproses tanpa subtitle"
     }};
 
     async function poll() {{
@@ -432,9 +415,8 @@ STATUS_TEMPLATE = """<!DOCTYPE html>
       }}
 
       if (data.subtitle_status && subtitleLabels[data.subtitle_status]) {{
-        let extra = data.subtitle_error ? ("<br><span style='font-size:0.7rem;color:var(--muted)'>" + data.subtitle_error + "</span>") : "";
         document.getElementById("subtitle-info").innerHTML =
-          '<div class="subtitle-status">' + subtitleLabels[data.subtitle_status] + extra + '</div>';
+          '<div class="subtitle-status">' + subtitleLabels[data.subtitle_status] + '</div>';
       }}
 
       let doneCount = 0;
@@ -492,18 +474,28 @@ def process():
         return redirect(url_for("index"))
 
     video_path = request.form.get("video_path", "").strip()
-    youtube_url = request.form.get("youtube_url", "").strip()
     raw_text = request.form.get("raw_text", "")
+    srt_file = request.files.get("srt_file")
 
     if not os.path.isfile(video_path):
-        return f"<h2>File tidak ditemukan:</h2><p>{video_path}</p><a href='/'>Kembali</a>", 400
+        return f"<h2>File video tidak ditemukan:</h2><p>{video_path}</p><a href='/'>Kembali</a>", 400
 
     jobs, errors = parse_lines(raw_text)
     if not jobs:
         msg = "<br>".join(errors) if errors else "Tidak ada baris yang valid."
         return f"<h2>Format tidak valid</h2><p>{msg}</p><a href='/'>Kembali</a>", 400
 
+    # Buat session ID dan direktori lebih awal untuk menyimpan file upload
     session_id = uuid.uuid4().hex[:10]
+    session_dir = os.path.join(OUTPUT_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    # Simpan file subtitle jika diunggah pengguna
+    full_srt_path = None
+    if srt_file and srt_file.filename:
+        full_srt_path = os.path.join(session_dir, "uploaded_sub.srt")
+        srt_file.save(full_srt_path)
+
     clips = []
     for idx, (start, end, title) in enumerate(jobs, start=1):
         safe_title = sanitize_filename(title)
@@ -522,16 +514,14 @@ def process():
     with JOBS_LOCK:
         JOBS[session_id] = {
             "video_path": video_path,
-            "youtube_url": youtube_url,
             "clips": clips,
             "finished": False,
             "fatal_error": None,
             "subtitle_status": "skipped",
-            "subtitle_error": None,
             "created": time.time(),
         }
 
-    thread = threading.Thread(target=run_job, args=(session_id, video_path, youtube_url), daemon=True)
+    thread = threading.Thread(target=run_job, args=(session_id, video_path, full_srt_path), daemon=True)
     thread.start()
 
     return redirect(url_for("status_page", session_id=session_id))
@@ -553,7 +543,6 @@ def api_status(session_id):
         "finished": state["finished"],
         "fatal_error": state["fatal_error"],
         "subtitle_status": state["subtitle_status"],
-        "subtitle_error": state["subtitle_error"],
         "clips": state["clips"],
     })
 
