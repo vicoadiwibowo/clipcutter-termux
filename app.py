@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Clip Cutter Web - untuk dijalankan di Termux / OpenWrt
+Clip Cutter Web - untuk dijalankan di Termux
 Potong video berdasarkan daftar timestamp yang di-paste,
 dengan audio & video presisi (sinkron, tidak telat),
 progress % real-time per klip, preview video di web,
-dan fitur upload manual subtitle (.srt) agar kebal dari blokir YouTube (Anti-429).
+dan fitur upload manual subtitle (.srt) agar kebal dari blokir YouTube.
+
+Subtitle di-burn pakai file .ass custom (bukan .srt+force_style),
+supaya ukuran & posisi font PRESISI sesuai yang diset -- tidak kena
+auto-scaling tersembunyi dari ffmpeg saat convert srt->ass internal.
 """
 
 import os
@@ -63,7 +67,25 @@ def to_seconds(hms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s)
 
 
-# ---------- Subtitle: Parsing Lokal (.srt) ----------
+def probe_square_size(path: str, default: int = 1080) -> int:
+    """Cari lebar & tinggi video asli, hasil crop 1:1 = sisi terpendek dari keduanya."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        w_str, h_str = result.stdout.strip().split(",")
+        w, h = int(w_str), int(h_str)
+        return min(w, h)
+    except Exception:
+        return default
+
+
+# ---------- Subtitle: Parsing (.srt) ----------
 
 def parse_srt(path: str):
     try:
@@ -71,7 +93,7 @@ def parse_srt(path: str):
     except Exception as e:
         print(f"Error membaca file srt: {e}")
         return []
-        
+
     entries = []
     blocks = re.split(r"\n\s*\n", text.strip())
     for block in blocks:
@@ -96,15 +118,59 @@ def parse_srt(path: str):
     return entries
 
 
-def build_clip_srt(entries, clip_start_sec, clip_end_sec, out_path):
-    def fmt(t):
-        t = max(0.0, t)
-        h = int(t // 3600); t -= h * 3600
-        m = int(t // 60); t -= m * 60
-        s = int(t); ms = int(round((t - s) * 1000))
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+# ---------- Subtitle: Build .ass presisi per klip ----------
 
-    lines = []
+def _format_ass_time(t: float) -> str:
+    t = max(0.0, t)
+    h = int(t // 3600); t -= h * 3600
+    m = int(t // 60); t -= m * 60
+    s = int(t)
+    cs = int(round((t - s) * 100))
+    if cs >= 100:
+        cs = 0
+        s += 1
+    return f"{h:01d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    text = text.replace("\\", "\\\\")
+    text = text.replace("{", "\\{").replace("}", "\\}")
+    text = text.replace("\n", "\\N")
+    return text
+
+
+def build_clip_ass(entries, clip_start_sec, clip_end_sec, out_path, square_size=1080):
+    """
+    Bikin file .ass khusus untuk 1 klip, dengan PlayResX/Y dipatok SAMA
+    dengan ukuran video hasil crop -- supaya FontSize/MarginV yang diset
+    di style benar-benar presisi, tidak di-auto-scale ffmpeg.
+    """
+    fontsize = max(20, round(square_size * 0.044))   # ~4.4% tinggi frame
+    marginv = round(square_size * 0.075)             # ~7.5% dari tepi bawah
+    margin_lr = round(square_size * 0.055)           # jarak kiri-kanan
+    outline = max(2, round(square_size * 0.0028))
+    shadow = 1
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {square_size}\n"
+        f"PlayResY: {square_size}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,Arial,{fontsize},&H00FFFFFF,&H000000FF,&H00000000,"
+        f"&H00000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},2,"
+        f"{margin_lr},{margin_lr},{marginv},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    lines = [header]
     count = 0
     for start, end, text in entries:
         if end <= clip_start_sec or start >= clip_end_sec:
@@ -114,13 +180,14 @@ def build_clip_srt(entries, clip_start_sec, clip_end_sec, out_path):
         if rel_end <= rel_start:
             continue
         count += 1
-        lines.append(str(count))
-        lines.append(f"{fmt(rel_start)} --> {fmt(rel_end)}")
-        lines.append(text)
-        lines.append("")
+        ass_text = _escape_ass_text(text)
+        lines.append(
+            f"Dialogue: 0,{_format_ass_time(rel_start)},{_format_ass_time(rel_end)},"
+            f"Default,,0,0,0,,{ass_text}\n"
+        )
 
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write("".join(lines))
     return count
 
 
@@ -168,26 +235,19 @@ CROP_1TO1 = (
     "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
 )
 
-# REVISI UKURAN UNTUK FORMAT 1:1
-SUBTITLE_STYLE = (
-    "FontName=Arial,FontSize=14,Bold=1,"
-    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-    "BorderStyle=1,Outline=1,Shadow=1,MarginV=25,Alignment=2"
-)
 
-
-def cut_clip(input_path, start, end, out_path, on_progress, srt_path=None):
+def cut_clip(input_path, start, end, out_path, on_progress, ass_path=None):
     """
     Potong video, crop ke rasio 1:1 (persegi, tengah), dan opsional
-    burn-in subtitle. Selalu re-encode karena ada filter crop.
+    burn-in subtitle dari file .ass yang sudah presisi ukurannya.
     """
     duration = max(1, to_seconds(end) - to_seconds(start))
 
     filters = [CROP_1TO1]
-    has_subtitle = bool(srt_path)
+    has_subtitle = bool(ass_path)
     if has_subtitle:
-        escaped = escape_for_ffmpeg_filter(srt_path)
-        filters.append(f"subtitles='{escaped}':force_style='{SUBTITLE_STYLE}'")
+        escaped = escape_for_ffmpeg_filter(ass_path)
+        filters.append(f"subtitles='{escaped}'")
     vf = ",".join(filters)
 
     cmd = [
@@ -240,6 +300,9 @@ def run_job(session_id, video_path, full_srt_path):
     state = JOBS[session_id]
     session_dir = os.path.join(OUTPUT_DIR, session_id)
 
+    square_size = probe_square_size(video_path)
+    print(f"[info] Ukuran crop 1:1 terdeteksi: {square_size}x{square_size}")
+
     subtitle_entries = None
     if full_srt_path and os.path.exists(full_srt_path):
         print(f"[subtitle] Membaca file subtitle lokal: {full_srt_path}")
@@ -264,16 +327,18 @@ def run_job(session_id, video_path, full_srt_path):
         end_sec = to_seconds(clip["end"])
 
         used_subtitle = False
-        clip_srt_path = None
+        clip_ass_path = None
         if subtitle_entries:
-            candidate_srt = os.path.join(session_dir, f"{clip['filename']}.srt")
-            n_lines = build_clip_srt(subtitle_entries, start_sec, end_sec, candidate_srt)
+            candidate_ass = os.path.join(session_dir, f"{clip['filename']}.ass")
+            n_lines = build_clip_ass(
+                subtitle_entries, start_sec, end_sec, candidate_ass, square_size=square_size
+            )
             if n_lines > 0:
-                clip_srt_path = candidate_srt
+                clip_ass_path = candidate_ass
                 used_subtitle = True
 
         success, log = cut_clip(
-            video_path, clip["start"], clip["end"], out_path, cb, srt_path=clip_srt_path
+            video_path, clip["start"], clip["end"], out_path, cb, ass_path=clip_ass_path
         )
 
         clip["has_subtitle"] = used_subtitle
@@ -486,12 +551,10 @@ def process():
         msg = "<br>".join(errors) if errors else "Tidak ada baris yang valid."
         return f"<h2>Format tidak valid</h2><p>{msg}</p><a href='/'>Kembali</a>", 400
 
-    # Buat session ID dan direktori lebih awal untuk menyimpan file upload
     session_id = uuid.uuid4().hex[:10]
     session_dir = os.path.join(OUTPUT_DIR, session_id)
     os.makedirs(session_dir, exist_ok=True)
 
-    # Simpan file subtitle jika diunggah pengguna
     full_srt_path = None
     if srt_file and srt_file.filename:
         full_srt_path = os.path.join(session_dir, "uploaded_sub.srt")
