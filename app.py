@@ -73,6 +73,8 @@ def download_subtitles(youtube_url: str, session_dir: str):
     Return: (path_srt atau None, pesan_error atau None)
     """
     out_template = os.path.join(session_dir, "full_sub")
+    
+    # REVISI: Menghapus extractor-args android yang bermasalah dan menambah jeda anti-429
     cmd = [
         "yt-dlp",
         "--skip-download",
@@ -80,11 +82,9 @@ def download_subtitles(youtube_url: str, session_dir: str):
         "--write-auto-sub",
         "--sub-lang", "id",
         "--convert-subs", "srt",
-        "--extractor-args", "youtube:player_client=android",
-        "--js-runtimes", "node",
-        "--sleep-requests", "3",
-        "--retries", "3",
-        "--retry-sleep", "10",
+        "--sleep-requests", "4",
+        "--retries", "5",
+        "--retry-sleep", "15",
         "-o", out_template + ".%(ext)s",
         youtube_url,
     ]
@@ -106,11 +106,9 @@ def download_subtitles(youtube_url: str, session_dir: str):
             "--write-auto-sub",
             "--sub-lang", "en",
             "--convert-subs", "srt",
-            "--extractor-args", "youtube:player_client=android",
-            "--js-runtimes", "node",
-            "--sleep-requests", "3",
-            "--retries", "3",
-            "--retry-sleep", "10",
+            "--sleep-requests", "4",
+            "--retries", "5",
+            "--retry-sleep", "15",
             "-o", out_template + ".%(ext)s",
             youtube_url,
         ]
@@ -119,8 +117,9 @@ def download_subtitles(youtube_url: str, session_dir: str):
         except subprocess.TimeoutExpired:
             return None, "Timeout saat mengunduh subtitle (300 detik)."
         matches = glob.glob(out_template + "*.srt")
+        
     if not matches:
-        return None, (result.stderr or "Subtitle tidak ditemukan untuk video ini.")[-1500:]
+        return None, (result.stderr or "Subtitle tidak ditemukan atau kena limit 429 YouTube.")[-1500:]
 
     # Prioritaskan subtitle bahasa Indonesia kalau ada beberapa file
     matches.sort(key=lambda p: 0 if ".id." in p else 1)
@@ -225,7 +224,7 @@ CROP_1TO1 = (
     "x='(iw-min(iw\\,ih))/2':y='(ih-min(iw\\,ih))/2'"
 )
 
-# REVISI UKURAN DAN POSISI SUBTITLE
+# Setingan Subtitle Sebelumnya
 SUBTITLE_STYLE = (
     "FontName=Arial,FontSize=20,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
