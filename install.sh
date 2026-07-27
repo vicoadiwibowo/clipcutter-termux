@@ -9,18 +9,17 @@ echo "Clip Cutter - Auto Installer"
 echo "================================"
 
 echo "[1/5] Update & install paket dasar (python, ffmpeg, git)..."
-apt-get update -y
-apt-get upgrade -y \
+yes n | apt-get update -y
+yes n | apt-get upgrade -y \
   -o Dpkg::Options::="--force-confdef" \
   -o Dpkg::Options::="--force-confold"
-apt-get install -y \
+yes n | apt-get install -y \
   -o Dpkg::Options::="--force-confdef" \
   -o Dpkg::Options::="--force-confold" \
   python ffmpeg git
 
 echo "[2/5] Install Flask..."
-pip install --upgrade pip
-pip install flask
+pip install flask --break-system-packages 2>/dev/null || pip install flask
 
 echo "[3/5] Setup akses storage (izinkan lewat pop-up yang muncul)..."
 termux-setup-storage
