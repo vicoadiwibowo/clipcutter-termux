@@ -1,15 +1,22 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
 
+export DEBIAN_FRONTEND=noninteractive
+
 REPO_RAW="https://raw.githubusercontent.com/vicoadiwibowo/clipcutter-termux/main"
 
 echo "Clip Cutter - Auto Installer"
 echo "================================"
 
 echo "[1/5] Update & install paket dasar (python, ffmpeg, git)..."
-pkg update -y
-pkg upgrade -y
-pkg install -y python ffmpeg git
+apt-get update -y
+apt-get upgrade -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold"
+apt-get install -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold" \
+  python ffmpeg git
 
 echo "[2/5] Install Flask..."
 pip install --upgrade pip
