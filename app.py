@@ -236,7 +236,7 @@ CROP_1TO1 = (
 )
 
 WATERMARK_TEXT = "@omah_cliperr"
-WATERMARK_OPACITY = 0.15  # 0.0 = tak terlihat, 1.0 = solid penuh
+WATERMARK_OPACITY = 0.22  # 0.0 = tak terlihat, 1.0 = solid penuh
 
 
 def escape_drawtext(text: str) -> str:
@@ -254,6 +254,8 @@ def build_watermark_filter(square_size: int) -> str:
     return (
         f"drawtext=text='{escaped}':"
         f"fontcolor=white@{WATERMARK_OPACITY}:"
+        f"bordercolor=black@{WATERMARK_OPACITY}:"
+        "borderw=2:"
         f"fontsize={fontsize}:"
         "x=(w-text_w)/2:y=(h-text_h)/2"
     )
