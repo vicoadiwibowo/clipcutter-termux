@@ -39,18 +39,25 @@ if not BOT_TOKEN:
         BOT_TOKEN = open(token_file, encoding="utf-8").read().strip()
 
 # State ConversationHandler
-MAIN_MENU, ASK_PATH, ASK_TIMESTAMPS, ASK_SRT = range(4)
+MAIN_MENU, ASK_PATH, ASK_TIMESTAMPS, ASK_SRT, ASK_YOUTUBE_URL, ASK_DELETE_NAME = range(6)
 
 # Simpan session_id terakhir per chat_id (untuk fitur "Cek Status")
 LAST_SESSION = {}
 
 BTN_POTONG = "✂️ Potong Video Baru"
 BTN_STATUS = "📊 Cek Status"
+BTN_YOUTUBE = "⬇️ Download YouTube"
+BTN_LIST = "📃 Daftar Video"
+BTN_DELETE = "🗑️ Hapus Video"
 BTN_BATAL = "❌ Batal"
 BTN_LEWATI = "⏭️ Lewati (Tanpa Subtitle)"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_POTONG, BTN_STATUS], [BTN_BATAL]],
+    [
+        [BTN_POTONG, BTN_STATUS],
+        [BTN_YOUTUBE, BTN_LIST],
+        [BTN_DELETE, BTN_BATAL],
+    ],
     resize_keyboard=True,
 )
 
@@ -95,6 +102,36 @@ def _download_clip_bytes(download_url: str):
     resp = requests.get(f"{FLASK_BASE_URL}{download_url}", timeout=120)
     resp.raise_for_status()
     return resp.content
+
+
+def _start_youtube_download(url: str):
+    resp = requests.post(f"{FLASK_BASE_URL}/youtube/start", data={"url": url}, timeout=20)
+    if resp.status_code != 200:
+        return None, f"Server menolak (HTTP {resp.status_code})."
+    data = resp.json()
+    return data.get("job_id"), data.get("error")
+
+
+def _get_youtube_status(job_id: str):
+    resp = requests.get(f"{FLASK_BASE_URL}/youtube/status/{job_id}", timeout=15)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
+def _list_downloads():
+    resp = requests.get(f"{FLASK_BASE_URL}/downloads/list", timeout=15)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
+def _delete_download(name: str):
+    resp = requests.post(f"{FLASK_BASE_URL}/downloads/delete", data={"name": name}, timeout=15)
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
 # ---------- Handler ----------
@@ -250,6 +287,117 @@ async def watch_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id
     )
 
 
+async def menu_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Kirim link video YouTube yang mau diunduh.\n"
+        "Kualitas dikunci maksimal 1080p.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_YOUTUBE_URL
+
+
+async def receive_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    status_msg = await update.message.reply_text("⏳ Memulai download dari YouTube...")
+
+    job_id, err = await asyncio.to_thread(_start_youtube_download, url)
+    if not job_id:
+        await status_msg.edit_text(f"❌ Gagal memulai download.\n{err}")
+        await update.message.reply_text("Silakan pilih menu lagi.", reply_markup=MAIN_KEYBOARD)
+        return MAIN_MENU
+
+    await status_msg.edit_text("⏳ Mengunduh dari YouTube... 0%")
+    asyncio.create_task(watch_youtube_job(context, chat_id, job_id, status_msg.message_id))
+
+    await update.message.reply_text(
+        "Download berjalan di background. Kamu akan diberi tahu begitu selesai.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return MAIN_MENU
+
+
+async def watch_youtube_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int, job_id: str, status_message_id: int):
+    bot = context.bot
+    last_text = ""
+
+    while True:
+        data = await asyncio.to_thread(_get_youtube_status, job_id)
+        if data is None:
+            await asyncio.sleep(3)
+            continue
+
+        if data.get("status") == "error":
+            err = (data.get("error") or "")[:500]
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=status_message_id,
+                text=f"❌ Gagal mengunduh dari YouTube.\n{err}",
+            )
+            return
+
+        if data.get("status") == "done":
+            break
+
+        text = f"⏳ Mengunduh dari YouTube... {data.get('progress', 0)}%"
+        if text != last_text:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text=text)
+                last_text = text
+            except Exception:
+                pass
+        await asyncio.sleep(3)
+
+    filename = data.get("filename") or "(nama tidak diketahui)"
+    path = data.get("path") or ""
+    await bot.edit_message_text(
+        chat_id=chat_id, message_id=status_message_id,
+        text=(
+            f"✅ Selesai diunduh (max 1080p):\n{filename}\n\n"
+            f"Lokasi:\n{path}\n\n"
+            "Path ini bisa langsung dipakai di menu 'Potong Video Baru'."
+        ),
+    )
+
+
+async def menu_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    data = await asyncio.to_thread(_list_downloads)
+    if not data or not data.get("files"):
+        await update.message.reply_text("Belum ada video yang pernah diunduh.")
+        return MAIN_MENU
+
+    lines = ["📃 Daftar video ter-download:\n"]
+    for f in data["files"]:
+        lines.append(f"• {f['name']} ({f['size_mb']} MB)\n  {f['path']}")
+    await update.message.reply_text("\n".join(lines))
+    return MAIN_MENU
+
+
+async def menu_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    data = await asyncio.to_thread(_list_downloads)
+    if not data or not data.get("files"):
+        await update.message.reply_text("Belum ada video yang bisa dihapus.")
+        return MAIN_MENU
+
+    lines = ["Ketik nama file (persis) yang mau dihapus:\n"]
+    for f in data["files"]:
+        lines.append(f"• {f['name']}")
+    await update.message.reply_text("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+    return ASK_DELETE_NAME
+
+
+async def receive_delete_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    result = await asyncio.to_thread(_delete_download, name)
+
+    if result and result.get("success"):
+        await update.message.reply_text(f"🗑️ Berhasil dihapus: {name}", reply_markup=MAIN_KEYBOARD)
+    else:
+        err = result.get("error") if result else "Tidak diketahui."
+        await update.message.reply_text(f"❌ Gagal menghapus.\n{err}", reply_markup=MAIN_KEYBOARD)
+    return MAIN_MENU
+
+
 async def menu_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     session_id = LAST_SESSION.get(chat_id)
@@ -298,6 +446,9 @@ def main():
             MAIN_MENU: [
                 MessageHandler(filters.Regex(f"^{re.escape(BTN_POTONG)}$"), menu_potong),
                 MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), menu_status),
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_YOUTUBE)}$"), menu_youtube),
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_LIST)}$"), menu_list),
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"), menu_delete),
                 MessageHandler(filters.Regex(f"^{re.escape(BTN_BATAL)}$"), menu_batal),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, fallback),
             ],
@@ -314,6 +465,14 @@ def main():
                 MessageHandler(filters.Regex(f"^{re.escape(BTN_LEWATI)}$"), skip_srt),
                 MessageHandler(filters.Document.ALL, receive_srt_file),
                 MessageHandler(filters.Regex(r"(?i)^(skip|lewati)$"), skip_srt),
+            ],
+            ASK_YOUTUBE_URL: [
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_BATAL)}$"), menu_batal),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_youtube_url),
+            ],
+            ASK_DELETE_NAME: [
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_BATAL)}$"), menu_batal),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_delete_name),
             ],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
