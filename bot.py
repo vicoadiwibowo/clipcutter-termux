@@ -15,6 +15,7 @@ Jalankan:
 import os
 import io
 import re
+import html
 import asyncio
 import requests
 
@@ -102,6 +103,11 @@ def _download_clip_bytes(download_url: str):
     resp = requests.get(f"{FLASK_BASE_URL}{download_url}", timeout=120)
     resp.raise_for_status()
     return resp.content
+
+
+def code(text: str) -> str:
+    """Bungkus teks jadi format 'kode' Telegram (monospace, tap-to-copy)."""
+    return f"<code>{html.escape(str(text))}</code>"
 
 
 def _start_youtube_download(url: str):
@@ -353,10 +359,11 @@ async def watch_youtube_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int, jo
     await bot.edit_message_text(
         chat_id=chat_id, message_id=status_message_id,
         text=(
-            f"✅ Selesai diunduh (max 1080p):\n{filename}\n\n"
-            f"Lokasi:\n{path}\n\n"
+            f"✅ Selesai diunduh (max 1080p):\n{code(filename)}\n\n"
+            f"Lokasi (tap untuk copy):\n{code(path)}\n\n"
             "Path ini bisa langsung dipakai di menu 'Potong Video Baru'."
         ),
+        parse_mode="HTML",
     )
 
 
@@ -368,8 +375,8 @@ async def menu_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     lines = ["📃 Daftar video ter-download:\n"]
     for f in data["files"]:
-        lines.append(f"• {f['name']} ({f['size_mb']} MB)\n  {f['path']}")
-    await update.message.reply_text("\n".join(lines))
+        lines.append(f"• {html.escape(f['name'])} ({f['size_mb']} MB)\n  {code(f['path'])}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     return MAIN_MENU
 
 
@@ -379,10 +386,12 @@ async def menu_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Belum ada video yang bisa dihapus.")
         return MAIN_MENU
 
-    lines = ["Ketik nama file (persis) yang mau dihapus:\n"]
+    lines = ["Ketik nama file (persis) yang mau dihapus, atau tap nama di bawah untuk copy:\n"]
     for f in data["files"]:
-        lines.append(f"• {f['name']}")
-    await update.message.reply_text("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+        lines.append(f"• {code(f['name'])}")
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=ReplyKeyboardRemove(), parse_mode="HTML"
+    )
     return ASK_DELETE_NAME
 
 
