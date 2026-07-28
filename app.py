@@ -15,6 +15,7 @@ import os
 import re
 import time
 import uuid
+import glob
 import threading
 import shutil
 import subprocess
@@ -25,15 +26,23 @@ app = Flask(__name__)
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+DOWNLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
 LINE_PATTERN = re.compile(
     r"^\s*(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+(.+?)\s*$"
 )
 SRT_TIME_PATTERN = re.compile(
     r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
+YT_PROGRESS_PATTERN = re.compile(r"\[download\]\s+([\d.]+)%")
+YT_DEST_PATTERN = re.compile(r"\[(?:download|Merger)\].*?(?:Destination|into):\s*(.+)$")
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+YT_JOBS = {}
+YT_JOBS_LOCK = threading.Lock()
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 CLEANUP_INTERVAL_SECONDS = 30 * 60
@@ -317,6 +326,97 @@ def cleanup_old_outputs():
         except Exception as e:
             print(f"[cleanup] Error: {e}")
         time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+# ---------- Download video dari YouTube (kualitas dikunci max 1080p) ----------
+
+def run_youtube_download(job_id: str, url: str):
+    state = YT_JOBS[job_id]
+    out_template = os.path.join(DOWNLOADS_DIR, "%(title).150s.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--restrict-filenames",
+        "-o", out_template,
+        "--newline",
+        url,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, bufsize=1,
+        )
+    except FileNotFoundError:
+        state["status"] = "error"
+        state["error"] = "yt-dlp belum terinstall. Jalankan: pip install yt-dlp"
+        return
+
+    dest_found = None
+    last_lines = []
+    for line in proc.stdout:
+        line = line.strip()
+        last_lines.append(line)
+        last_lines[:] = last_lines[-15:]
+
+        m = YT_PROGRESS_PATTERN.search(line)
+        if m:
+            try:
+                state["progress"] = min(99, int(float(m.group(1))))
+            except ValueError:
+                pass
+
+        m2 = YT_DEST_PATTERN.search(line)
+        if m2:
+            dest_found = m2.group(1).strip()
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        state["status"] = "error"
+        state["error"] = "\n".join(last_lines)[-1500:]
+        return
+
+    filename = os.path.basename(dest_found) if dest_found else None
+    if not filename or not os.path.isfile(os.path.join(DOWNLOADS_DIR, filename)):
+        candidates = sorted(
+            glob.glob(os.path.join(DOWNLOADS_DIR, "*")),
+            key=os.path.getmtime, reverse=True,
+        )
+        filename = os.path.basename(candidates[0]) if candidates else None
+
+    state["status"] = "done"
+    state["progress"] = 100
+    state["filename"] = filename
+    state["path"] = os.path.join(DOWNLOADS_DIR, filename) if filename else None
+
+
+def list_downloaded_videos():
+    files = []
+    for name in sorted(os.listdir(DOWNLOADS_DIR)):
+        path = os.path.join(DOWNLOADS_DIR, name)
+        if os.path.isfile(path):
+            files.append({
+                "name": name,
+                "path": path,
+                "size_mb": round(os.path.getsize(path) / (1024 * 1024), 1),
+            })
+    return files
+
+
+def delete_downloaded_video(name: str):
+    safe_name = os.path.basename(name)  # cegah path traversal (../../dst)
+    path = os.path.join(DOWNLOADS_DIR, safe_name)
+    if not os.path.isfile(path):
+        return False, "File tidak ditemukan."
+    try:
+        os.remove(path)
+        return True, None
+    except OSError as e:
+        return False, str(e)
 
 
 # ---------- Job utama ----------
@@ -641,6 +741,51 @@ def api_status(session_id):
 def download_file(session_id, filename):
     folder = os.path.join(OUTPUT_DIR, session_id)
     return send_from_directory(folder, filename, as_attachment=False)
+
+
+@app.route("/youtube/start", methods=["POST"])
+def youtube_start():
+    url = request.form.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "URL kosong"}), 400
+
+    job_id = uuid.uuid4().hex[:10]
+    with YT_JOBS_LOCK:
+        YT_JOBS[job_id] = {
+            "status": "downloading",
+            "progress": 0,
+            "filename": None,
+            "path": None,
+            "error": None,
+            "url": url,
+        }
+
+    threading.Thread(target=run_youtube_download, args=(job_id, url), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/youtube/status/<job_id>")
+def youtube_status(job_id):
+    state = YT_JOBS.get(job_id)
+    if not state:
+        return jsonify({"error": "job tidak ditemukan"}), 404
+    return jsonify(state)
+
+
+@app.route("/downloads/list")
+def downloads_list():
+    return jsonify({"files": list_downloaded_videos()})
+
+
+@app.route("/downloads/delete", methods=["POST"])
+def downloads_delete():
+    name = request.form.get("name", "").strip()
+    if not name:
+        return jsonify({"success": False, "error": "nama file kosong"}), 400
+    success, err = delete_downloaded_video(name)
+    if not success:
+        return jsonify({"success": False, "error": err}), 404
+    return jsonify({"success": True})
 
 
 if __name__ == "__main__":
