@@ -39,7 +39,7 @@ if not BOT_TOKEN:
         BOT_TOKEN = open(token_file, encoding="utf-8").read().strip()
 
 # State ConversationHandler
-MAIN_MENU, ASK_PATH, ASK_TIMESTAMPS = range(3)
+MAIN_MENU, ASK_PATH, ASK_TIMESTAMPS, ASK_SRT = range(4)
 
 # Simpan session_id terakhir per chat_id (untuk fitur "Cek Status")
 LAST_SESSION = {}
@@ -47,20 +47,31 @@ LAST_SESSION = {}
 BTN_POTONG = "✂️ Potong Video Baru"
 BTN_STATUS = "📊 Cek Status"
 BTN_BATAL = "❌ Batal"
+BTN_LEWATI = "⏭️ Lewati (Tanpa Subtitle)"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[BTN_POTONG, BTN_STATUS], [BTN_BATAL]],
     resize_keyboard=True,
 )
 
+SRT_KEYBOARD = ReplyKeyboardMarkup(
+    [[BTN_LEWATI], [BTN_BATAL]],
+    resize_keyboard=True,
+)
+
 
 # ---------- Util komunikasi ke Flask ----------
 
-def _submit_job(video_path: str, raw_text: str):
+def _submit_job(video_path: str, raw_text: str, srt_bytes: bytes = None, srt_filename: str = None):
     """Panggil endpoint /process, return session_id atau None kalau gagal."""
+    files = None
+    if srt_bytes:
+        files = {"srt_file": (srt_filename or "subtitle.srt", srt_bytes, "text/plain")}
+
     resp = requests.post(
         f"{FLASK_BASE_URL}/process",
         data={"video_path": video_path, "raw_text": raw_text},
+        files=files,
         allow_redirects=True,
         timeout=30,
     )
@@ -119,31 +130,63 @@ async def receive_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def receive_timestamps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw_text = update.message.text
+    context.user_data["raw_text"] = update.message.text
+    await update.message.reply_text(
+        "Ada file subtitle .srt yang mau di-burn ke klip?\n\n"
+        "Kirim file .srt sekarang, atau tekan 'Lewati' kalau tidak pakai subtitle.",
+        reply_markup=SRT_KEYBOARD,
+    )
+    return ASK_SRT
+
+
+async def receive_srt_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    document = update.message.document
+    if not document.file_name.lower().endswith(".srt"):
+        await update.message.reply_text(
+            "File itu bukan .srt. Kirim file .srt yang benar, atau tekan 'Lewati'."
+        )
+        return ASK_SRT
+
+    tg_file = await document.get_file()
+    file_bytes = await tg_file.download_as_bytearray()
+
+    await update.message.reply_text("Subtitle diterima. Memulai proses...", reply_markup=MAIN_KEYBOARD)
+    await start_processing(
+        update, context,
+        srt_bytes=bytes(file_bytes), srt_filename=document.file_name,
+    )
+    return MAIN_MENU
+
+
+async def skip_srt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Oke, tanpa subtitle. Memulai proses...", reply_markup=MAIN_KEYBOARD)
+    await start_processing(update, context, srt_bytes=None, srt_filename=None)
+    return MAIN_MENU
+
+
+async def start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, srt_bytes=None, srt_filename=None):
     video_path = context.user_data.get("video_path", "")
+    raw_text = context.user_data.get("raw_text", "")
     chat_id = update.effective_chat.id
 
     status_msg = await update.message.reply_text("⏳ Mengirim ke server...")
 
-    session_id, err = await asyncio.to_thread(_submit_job, video_path, raw_text)
+    session_id, err = await asyncio.to_thread(
+        _submit_job, video_path, raw_text, srt_bytes, srt_filename
+    )
     if not session_id:
         await status_msg.edit_text(f"❌ Gagal memulai proses.\n{err}")
-        await update.message.reply_text("Silakan pilih menu lagi.", reply_markup=MAIN_KEYBOARD)
-        return MAIN_MENU
+        return
 
     LAST_SESSION[chat_id] = session_id
     await status_msg.edit_text(f"✅ Diterima. Memproses klip...\nSession: {session_id}")
 
-    # Jalankan pemantauan progress + pengiriman hasil di background,
-    # supaya bot tetap bisa merespons perintah lain sambil menunggu.
     asyncio.create_task(watch_job(context, chat_id, session_id, status_msg.message_id))
 
     await update.message.reply_text(
         "Proses berjalan di latar belakang. Kamu akan diberi tahu begitu selesai.\n"
-        "Bisa juga cek manual lewat menu 📊 Cek Status.",
-        reply_markup=MAIN_KEYBOARD,
+        "Bisa juga cek manual lewat menu 📊 Cek Status."
     )
-    return MAIN_MENU
 
 
 async def watch_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int, session_id: str, status_message_id: int):
@@ -265,6 +308,12 @@ def main():
             ASK_TIMESTAMPS: [
                 MessageHandler(filters.Regex(f"^{re.escape(BTN_BATAL)}$"), menu_batal),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_timestamps),
+            ],
+            ASK_SRT: [
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_BATAL)}$"), menu_batal),
+                MessageHandler(filters.Regex(f"^{re.escape(BTN_LEWATI)}$"), skip_srt),
+                MessageHandler(filters.Document.ALL, receive_srt_file),
+                MessageHandler(filters.Regex(r"(?i)^(skip|lewati)$"), skip_srt),
             ],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
