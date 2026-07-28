@@ -4,21 +4,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 REPO_RAW="https://raw.githubusercontent.com/vicoadiwibowo/clipcutter-termux/main"
-SELF_URL="$REPO_RAW/install.sh"
 CLIPCUTTER_DIR=~/clipcutter
-
-# --------------------------------------------------------------------
-# Kalau dijalankan lewat "curl | bash", stdin dipakai buat mengalirkan
-# isi script ini sendiri, jadi tidak bisa dipakai buat nanya input
-# (misal token bot). Kalau kondisi itu terdeteksi, download ulang diri
-# sendiri ke file lalu jalan ulang dengan akses keyboard normal (tty),
-# supaya tetap bisa interaktif tanpa kamu perlu ubah cara menjalankannya.
-# --------------------------------------------------------------------
-if [ ! -t 0 ]; then
-  echo "Menyiapkan installer supaya bisa interaktif..."
-  curl -fsSL "$SELF_URL" -o /tmp/clipcutter_install.sh
-  exec bash /tmp/clipcutter_install.sh < /dev/tty
-fi
 
 echo "Clip Cutter - Auto Installer"
 echo "================================"
@@ -56,22 +42,12 @@ for f in app.py bot.py; do
     || { echo "GAGAL: $f yang diunduh punya error sintaks."; exit 1; }
 done
 
-echo "[5/6] Setup token Bot Telegram..."
+echo "[5/6] Cek token Bot Telegram..."
 TOKEN_FILE="$CLIPCUTTER_DIR/bot_token.txt"
 if [ -s "$TOKEN_FILE" ]; then
-  echo "Token bot sudah ada dari sebelumnya, dipakai lagi."
+  echo "Token bot ditemukan, akan dipakai."
 else
-  echo ""
-  echo "Buat bot dulu di Telegram lewat @BotFather kalau belum punya,"
-  echo "lalu tempel token-nya di sini (boleh dikosongkan & Enter untuk"
-  echo "melewati -- nanti bot tidak otomatis jalan sampai token diisi)."
-  read -r -p "Bot Token: " BOT_TOKEN_INPUT
-  if [ -n "$BOT_TOKEN_INPUT" ]; then
-    echo "$BOT_TOKEN_INPUT" > "$TOKEN_FILE"
-    echo "Token tersimpan."
-  else
-    echo "Dilewati. Bot Telegram tidak akan dijalankan otomatis."
-  fi
+  echo "Token bot belum ada -- bot Telegram dilewati dulu (web tetap jalan normal)."
 fi
 
 echo "[6/6] Setup auto-start (tiap buka Termux & tiap HP restart)..."
